@@ -239,3 +239,8 @@ def send_message(chat_id, response, parse_mode=None):
     url = f"{API_URL}/sendMessage"
     requests.post(url, json=payload)
 
+'''
+delete this comment this is to check if the code is working
+This is a test comment to check if the code is working properly.
+It should not affect the functionality of the code.
+'''
