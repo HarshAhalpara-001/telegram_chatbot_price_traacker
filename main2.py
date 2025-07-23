@@ -15,7 +15,7 @@ from selenium.common.exceptions import TimeoutException
 from google import genai
 
 # Setup Gemini API
-client = genai.Client(api_key="AIzaSyCyFGzYJdXUXkBpIGt46Gfv7TDrk646V4U")
+client = genai.Client(api_key="") #<---- gemini access token.
 
 # Configure logging and stdout
 sys.stdout.reconfigure(encoding="utf-8")
