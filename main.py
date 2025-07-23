@@ -1,246 +1,203 @@
-from fastapi import FastAPI, Request
-import requests
+import os
 import sqlite3
-from bs4 import BeautifulSoup
-from urllib.parse import urlparse
-import time
-import re
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.common.exceptions import TimeoutException
-from google import genai
-import sys
-sys.stdout.reconfigure(encoding='utf-8')
+import subprocess
+from datetime import datetime
 
-# --- 0. FastAPI & Telegram Setup ---
+import requests
+from fastapi import FastAPI, Request, BackgroundTasks
+from apscheduler.schedulers.background import BackgroundScheduler
+import atexit
+import os
+import sys
+import sqlite3
+from datetime import datetime
+from scrapy.crawler import CrawlerProcess
+from scrapy.utils.project import get_project_settings
+
+from main2 import scrape_product  # Your scraping logic
+
+# ────────────────────────────────
+# 🔁 Telegram Setup
+# ────────────────────────────────
 app = FastAPI()
+
 BOT_TOKEN = "7746809844:AAHVMfdvWCTsZbelCFCDHVnZrBNJQKck09Y"
 API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-# --- 1. Gemini Setup ---
-client = genai.Client(api_key='AIzaSyCyFGzYJdXUXkBpIGt46Gfv7TDrk646V4U')
 
-# --- 2. SQLite DB ---
-conn = sqlite3.connect("selectors.db", check_same_thread=False)
+def send_message(chat_id, text, parse_mode=None):
+    payload = {"chat_id": chat_id, "text": text}
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+    requests.post(f"{API_URL}/sendMessage", json=payload)
+
+
+# ────────────────────────────────
+# 📦 Database Setup
+# ────────────────────────────────
+
+DB_PATH = os.path.abspath("selectors.db")
+conn = sqlite3.connect(DB_PATH, check_same_thread=False)
 cursor = conn.cursor()
-cursor.execute('''
-    CREATE TABLE IF NOT EXISTS selectors (
-        domain TEXT PRIMARY KEY,
-        title_selector TEXT,
-        price_selector TEXT
-    )
-''')
-cursor.execute('''
-    CREATE TABLE IF NOT EXISTS user_urls (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        chat_id INTEGER,
-        url TEXT,
-        domain TEXT,
-        title TEXT,
-        price TEXT,
-        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-        UNIQUE(chat_id, url)
-    )
-''')
-cursor.execute('''
-    CREATE TABLE IF NOT EXISTS track_prices (
+
+cursor.executescript('''
+CREATE TABLE IF NOT EXISTS selectors (
+    domain TEXT PRIMARY KEY,
+    title_selector TEXT,
+    price_selector TEXT
+);
+CREATE TABLE IF NOT EXISTS user_urls (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_url_id INTEGER,  
+    chat_id INTEGER,
+    url TEXT,
+    domain TEXT,
+    title TEXT,
     price TEXT,
-    checked_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (user_url_id) REFERENCES user_urls(id) ON DELETE CASCADE
-)
+    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+    remain_to_send_notification BOOLEAN DEFAULT 1,
+    UNIQUE(chat_id, url)
+);
 ''')
 conn.commit()
 
-# --- 3. Webhook Route ---
-@app.post("/webhook")
-async def webhook(request: Request):
-    data = await request.json()
-    message = data.get("message")
-    if not message:
-        return {"ok": True}  # skip if it's not a valid text message
+# ────────────────────────────────
+# 🕷️ Scrapy Runner (Safe via subprocess)
+# ────────────────────────────────
 
+def run_scrapy_with_notifications():
+    try:
+        print("🕷️ Launching Scrapy spider directly in Python...")
+
+        # ✅ Setup path to the scrapy project directory
+        base_dir = os.path.abspath(os.path.dirname(__file__))
+        scraper_dir = os.path.join(base_dir, "product_scraper", "product_scraper")  # inner scrapy app dir
+        os.chdir(scraper_dir)
+        sys.path.append(scraper_dir)
+
+        # ✅ Import spider dynamically
+        from spiders.universal_spider import UniversalSpider
+
+        # ✅ Run Scrapy Spider
+        process = CrawlerProcess(get_project_settings())
+        process.crawl(UniversalSpider)
+        process.start()
+
+        print("✅ Scrapy run finished, checking for notifications...")
+
+        # ✅ Notification logic (your DB logic stays unchanged)
+        db_conn = sqlite3.connect(DB_PATH)
+        db_cursor = db_conn.cursor()
+        db_cursor.execute("SELECT id, chat_id, title, price, url FROM user_urls WHERE remain_to_send_notification = 1")
+        rows = db_cursor.fetchall()
+
+        for row in rows:
+            prod_id, chat_id, title, price, url = row
+            message = (
+                f"🔔 *Price Update!*\n\n"
+                f"*{title}*\n"
+                f"Price: {price}\n"
+                f"[View Product]({url})"
+            )
+            send_message(chat_id, message)
+            db_cursor.execute("UPDATE user_urls SET remain_to_send_notification = 0 WHERE id = ?", (prod_id,))
+        
+        db_conn.commit()
+        db_conn.close()
+        print("✅ Notifications sent.")
+
+    except Exception as e:
+        print(f"❌ Error running Scrapy or sending messages: {e}")# ────────────────────────────────
+# ⏰ Schedule Background Job
+# ────────────────────────────────
+
+scheduler = BackgroundScheduler()
+scheduler.add_job(run_scrapy_with_notifications, 'interval', minutes=5)  # or seconds=60 for testing
+scheduler.start()
+atexit.register(lambda: scheduler.shutdown())
+
+
+# ────────────────────────────────
+# 📬 Telegram Webhook Endpoint
+# ────────────────────────────────
+
+@app.post("/webhook")
+async def webhook(request: Request, background: BackgroundTasks):
+    data = await request.json()
+    message = data.get("message", {})
     chat_id = message.get("chat", {}).get("id")
     text = message.get("text", "").strip()
 
     if not chat_id or not text:
         return {"ok": True}
-    if text.startswith("/delete_"):
-        # Handle deletion of a specific product
+
+    # 🔄 Handle Commands
+    if text.startswith("/delete"):
         try:
-            id = text.split("_")[1].strip()
-            print(f"Deleting product with ID: {id} for chat_id: {chat_id}")
-            cursor.execute("DELETE FROM user_urls WHERE id = ?", (id,))
+            product_id = text.replace("/delete", "").strip()
+            cursor.execute("DELETE FROM user_urls WHERE id = ?", (product_id,))
             conn.commit()
-            send_message(chat_id, {"message": "✅ Product deleted successfully."})
-        except IndexError:
-            send_message(chat_id, {"message": "❌ Please provide a valid URL to delete."})
-        except Exception as e:
-            send_message(chat_id, f"❌ Error: {e}")
+            send_message(chat_id, "✅ Product deleted.")
+        except Exception:
+            send_message(chat_id, "❌ Invalid delete command.")
         return {"ok": True}
-    if text == "/list":
-        # Fetch and send list of tracked products
+
+    elif text == "/list":
         cursor.execute("SELECT id, title, price, url FROM user_urls WHERE chat_id = ?", (chat_id,))
         rows = cursor.fetchall()
 
         if not rows:
-            send_message(chat_id, {"message": "📭 You're not tracking any products yet."})
+            send_message(chat_id, "📭 No products being tracked.")
         else:
             msg = "📋 *Your Tracked Products:*\n\n"
-            for idx, (id,title, price, url) in enumerate(rows, start=1):
-                msg += f"{idx}. *{title}*\nPrice: {price}\n[Link]({url})\nclick to delete /delete_{id}\n\n"
-            send_message(chat_id,{"message": msg}, 
-                        #  parse_mode="Markdown"
-                         )
-            return {"ok": True}
-    print(f"Received message: {text} from chat_id: {chat_id}")
-    if not text.startswith("http"):
-        send_message(chat_id, {"message": "📦 Please send a valid product URL (Amazon/Zepto/Ajio)."})
+            for idx, (id, title, price, url) in enumerate(rows, start=1):
+                msg += f"{idx}. *{title}*\nPrice: {price}\n[View Product]({url})\nDelete: `/delete{id}`\n\n"
+                msg += "-" * 40 + "\n"
+            send_message(chat_id, msg, parse_mode="Markdown")
         return {"ok": True}
 
-    # --- Start scraping workflow ---
-    try:
-        cursor.execute("SELECT 1 FROM user_urls WHERE chat_id = ? AND url = ?", (chat_id, text))
-        if cursor.fetchone():
-            send_message(chat_id, {"message": "🔁 You've already added this product. We'll notify you if the price changes. /list to see the list."})
-            return {"ok": True}
-    except Exception as e:
-        send_message(chat_id, {"message": f"❌ Error of timepass: {e}"})
-    try:
-        response = scrape_product(text)
-        print(f"Scraped response: {response}")
-        cursor.execute("INSERT INTO user_urls (chat_id, url, domain, title, price) VALUES (?, ?, ?, ?, ?)",
-                       (chat_id, text, response['Domain'], response['Title'], response['Price']))
-        conn.commit()
-        send_message(chat_id, {"message": f"✅ Product added successfully:\n\n*Title:* {response['Title']}\n*Price:* {response['Price']}\n*Link:* {text}\n\n you can click on /list to see all your tracked products."})
-    except Exception as e:
-        send_message(chat_id, {"message": f"❌ Error: {e}"})
+    elif not text.startswith("http"):
+        send_message(chat_id, "❌ Please send a valid product URL.")
+        return {"ok": True}
+
+    # 🚫 Duplicate check
+    cursor.execute("SELECT 1 FROM user_urls WHERE chat_id = ? AND url = ?", (chat_id, text))
+    if cursor.fetchone():
+        send_message(chat_id, "🔁 Product already being tracked.")
+        return {"ok": True}
+
+    # ➕ Process new product
+    send_message(chat_id, "⏳ Processing product...")
+    background.add_task(process_url_task, chat_id, text)
+
     return {"ok": True}
 
-# --- 4. Scraper Function ---
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
 
-def scrape_product(url: str) -> dict:
-    chrome_options = Options()
-    chrome_options.add_argument("--headless=new")  # or False if you want browser UI
-    chrome_options.add_argument("--disable-gpu")
-    chrome_options.add_argument("--no-sandbox")
-    chrome_options.add_argument("--disable-dev-shm-usage")
-    chrome_options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/113.0 Safari/537.36")
+# ────────────────────────────────
+# 🎯 Process Product URL and Save
+# ────────────────────────────────
 
-    driver = None
+def process_url_task(chat_id: int, url: str):
     try:
-        driver = webdriver.Chrome(options=chrome_options)
-        driver.set_page_load_timeout(10)
-        driver.get(url)
+        result = scrape_product(url)  # from main2.py
 
-        # Wait until body is fully loaded (or replace with smarter condition)
-        WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located((By.TAG_NAME, "body"))
+        cursor.execute('''
+            INSERT INTO user_urls (chat_id, url, domain, title, price, remain_to_send_notification)
+            VALUES (?, ?, ?, ?, ?, 1)
+        ''', (chat_id, url, result["Domain"], result["Title"], result["Price"]))
+        conn.commit()
+
+        send_message(
+            chat_id,
+            f"✅ Product added:\n\n*{result['Title']}*\nPrice: {result['Price']}",
+            parse_mode="Markdown"
         )
 
-        final_url = driver.current_url  # Use after redirection
-        html = driver.page_source
-        soup = BeautifulSoup(html, "html.parser")
+        cursor.execute('''
+            UPDATE user_urls
+            SET remain_to_send_notification = 0
+            WHERE chat_id = ? AND url = ?
+        ''', (chat_id, url))
+        conn.commit()
 
-    except TimeoutException:
-        raise Exception("Page load timed out.")
     except Exception as e:
-        raise Exception(f"Failed to load page: {e}")
-    finally:
-        if driver:
-            driver.quit()
-
-    # --- Determine actual domain ---
-    domain = urlparse(final_url).netloc
-
-    # --- Check DB for selectors ---
-    cursor.execute("SELECT title_selector, price_selector FROM selectors WHERE domain=?", (domain,))
-    row = cursor.fetchone()
-
-    if not row:
-        # Use Gemini to extract selectors
-        prompt = f"""
-        You are given the HTML of a product page from an e-commerce website.
-        Find and return ONLY the class names used to get the following:
-
-        1. Product Title
-        2. Product Price
-
-        Only give class-based selectors (no ids). Example format:
-        Title: class="product-title"
-        Price: class="product-price"
-
-        Only use class where the actual text is present (not parent divs).
-
-        HTML:
-        {html[:]}  # limit to avoid token overflow
-        """
-        gemini_response = client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
-        result = gemini_response.text
-
-        title_match = re.search(r'Title:\s*class="([^"]+)"', result)
-        price_match = re.search(r'Price:\s*class="([^"]+)"', result)
-
-        title_selector = title_match.group(1) if title_match else None
-        price_selector = price_match.group(1) if price_match else None
-
-        if title_selector and price_selector:
-            cursor.execute("INSERT OR REPLACE INTO selectors VALUES (?, ?, ?)", (domain, title_selector, price_selector))
-            conn.commit()
-        else:
-            raise Exception("Gemini could not extract class selectors.")
-    else:
-        title_selector, price_selector = row
-
-    # --- Extract title and price from soup ---
-    def find_element(soup, selector):
-        return soup.find(class_=selector)  # only class-based selection
-
-    title_elem = find_element(soup, title_selector)
-    price_elem = find_element(soup, price_selector)
-    print(title_selector, price_selector)
-    title = title_elem.get_text(strip=True) if title_elem else "❌ Title not found"
-    price = price_elem.get_text(strip=True) if price_elem else "❌ Price not found"
-
-    return {
-        "Domain": domain,
-        "Title": title,
-        "Price": price
-    }
-
-
-# --- 5. Send Message ---
-def send_message(chat_id, response, parse_mode=None):
-    
-
-    if isinstance(response, dict):
-        text = response.get("message", "")
-        parse_mode = response.get("parse_mode", parse_mode)
-    else:
-        text = response
-
-    payload = {
-        "chat_id": chat_id,
-        "text": text,
-        # "reply_markup": {
-        #     "keyboard": [[{"text": "/list"}]],  # You can add more: [{"text": "/list"}, {"text": "/add"}]
-        #     "resize_keyboard": True,
-        #     "one_time_keyboard": False
-        # }
-    }
-
-    if parse_mode:
-        payload["parse_mode"] = parse_mode
-
-    url = f"{API_URL}/sendMessage"
-    requests.post(url, json=payload)
-
-'''
-delete this comment this is to check if the code is working
-This is a test comment to check if the code is working properly.
-It should not affect the functionality of the code.
-'''
+        send_message(chat_id, f"❌ Error while adding product: {e}")
