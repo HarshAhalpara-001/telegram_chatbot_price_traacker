@@ -21,7 +21,7 @@ from main2 import scrape_product  # Your scraping logic
 # ────────────────────────────────
 app = FastAPI()
 
-BOT_TOKEN = "7746809844:AAHVMfdvWCTsZbelCFCDHVnZrBNJQKck09Y"
+BOT_TOKEN = "" # token of telegram chatbot you get from @botfather 
 API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 
